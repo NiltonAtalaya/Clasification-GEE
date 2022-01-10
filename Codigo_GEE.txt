@@ -1,0 +1,1013 @@
+//Definición de fechas,satélite,porcentaje de nube,sombra)
+var param = {
+    't0': '2020-01-01',
+    't1': '2020-12-31',
+    'satellite': 'l8', // l5, l7, l8, lx(fusion de l5+l7)
+    'cloud_cover': 50,//porcentaje de nube
+    'pais': 'Perú', // Options: 'Perú'
+    'shadowSum':3500,   //0 - 10000  Defaut 3500  
+    'cloudThresh':50,  // 0 - 100    Defaut 10
+};
+
+/**
+ * Definición de imágenes que serán excluidas del procesamiento (Blacklist)
+ */
+var blackList = [
+"LC08_008064_20200203","LC08_008064_20200322","LC08_008064_20200509",
+"LC08_008064_20200525","LC08_008064_20200728","LC08_009064_20201007",
+"LC08_009064_20201023","LC08_009064_20201124","LC08_009064_20200921",
+"LC08_009064_20200905","LC08_008065_20201219","LC08_008065_20200914",
+"LC08_008065_20200813","LC08_008065_20200728","LC08_008065_20200525",
+"LC08_008065_20200509","LC08_008065_20200322","LC08_008064_20201117",
+"LC08_008065_20200712","LC08_008065_20200610",
+];
+
+/**
+ * Importar geometrias: áreas de estudio(ventilla-pomacochas)
+ */
+ 
+var AssetRegions = 'users/atalayanilton/ventilla';
+
+var region = ee.FeatureCollection(AssetRegions)
+var grid = region
+
+
+//*****
+
+/**  
+ * @name
+ *      reescale
+ * @description
+ *      Aplica rescalado a una imagen
+ * @argument
+ *      Objecto que contiene los atributos
+ *          @attribute image {ee.Image}
+ *          @attribute min {Integer}
+ *          @attribute max {Integer}
+ * @example
+ *      var obj = {
+ *          'image': image.expression('b(red) + b(green) + b(blue)'),
+ *          'min': 2000,
+ *          'max': 8000
+ *      };
+ *      
+ *      var reescaled = reescale(obj);
+ * @returns
+ *      ee.Image
+ */
+var rescale = function (obj) {
+
+    var image = obj.image.subtract(obj.min).divide(ee.Number(obj.max).subtract(obj.min));
+
+    return image;
+};
+
+/**
+ * @name
+ *      puntuacion en las nubes
+ * @description
+ *      Crea  una máscara de nubes usando varios indicadores de presença de nubes
+ * @argument
+ *      @ imagen de atributo {ee.Image}
+ * @example
+ *      var image = cloudScore(image);
+ * @returns 
+ *      ee.Image
+ */
+var cloudScore = function (image) {
+
+    var cloudThresh = param.cloudThresh;
+
+    // calcular varios indicadores de nubosidad y tomar el mínimo de ellos.
+    var score = ee.Image(1.0);
+
+    // las nubes son razonablemente brillantes en la banda azul.
+    score = score.min(rescale({
+        'image': image.select(['blue']),
+        'min': 1000,
+        'max': 3000
+    }));
+
+    // las nubes son razonablemente brillantes en todas las bandas visibles.
+    score = score.min(rescale({
+        'image': image.expression("b('red') + b('green') + b('blue')"),
+        'min': 2000,
+        'max': 8000
+    }));
+
+    // las nubes son razonablemente brillantes en todas las bandas infrarrojas.
+    score = score.min(rescale({
+        'image': image.expression("b('nir') + b('swir1') + b('swir2')"),
+        'min': 3000,
+        'max': 8000
+    }));
+
+    // las nubes tienen una temperatura razonablemente fria.
+    var temperature = image.select(['temp']);
+
+    // score = score.where(temperature.mask(),
+    //     score.min(rescale({
+    //         'image': temperature,
+    //         'min': 300,
+    //         'max': 290
+    //     })));
+
+    // sin embargo las nubes no son nieve.
+    var ndsi = image.normalizedDifference(['green', 'swir1']);
+
+    score = score.min(rescale({
+        'image': ndsi,
+        'min': 0.8,
+        'max': 0.6
+    })).multiply(100).byte();
+
+    score = score.gte(cloudThresh).rename('cloudScoreMask');
+
+    return image.addBands(score);
+};
+
+/**
+ * @name
+ *      tdom
+ * @descripción
+ * El método TDOM primero calcula la media y la desviación estándar del infrarrojo cercano (NIR) y
+ * Bandas de infrarrojos de onda corta (SWIR1) a través de una colección de imágenes. Para cada imagen, el algoritmo luego
+ * calcula la puntuación z de las bandas NIR y SWIR1 (z (Mb)) (Ecuación (5)) (Figura 2). Cada imagen también tiene un
+ * métrica de oscuridad calculada como la suma de las bandas NIR y SWIR1 (). Luego se identifican las sombras de las nubes
+ * si un píxel tiene una puntuación z inferior a −1 para las bandas NIR y SWIR1 y una oscuridad
+ * valor inferior a 0,35 (Ecuación (8)). Estos umbrales se eligieron después de una extensa evaluación cualitativa de
+ * Salidas TDOM de todo el CONUS.
+ * 
+ * https://www.mdpi.com/2072-4292/10/8/1184/htm
+ * @argument
+ *      Objecto que cotiene los atributos
+ *          @attribute collection {ee.ImageCollection}
+ *          @attribute zScoreThresh {Float}
+ *          @attribute shadowSumThresh {Float}
+ *          @attribute dilatePixels {Integer}
+ * @ejemplo
+ *      var obj = {
+ *          'collection': collection,
+ *          'zScoreThresh': -1,
+ *          'shadowSumThresh': 0.5,
+ *          'dilatePixels': 2,
+ *      };
+ *      
+ *      collection = tdom(obj);
+ * @returns
+ *      ee.ImageCollection
+ */
+var tdom = function (obj) {
+
+    var shadowSumBands = ['nir', 'swir1'];
+
+    // Obtenga algunas estadísticas de píxeles para la serie temporal
+    var irStdDev = obj.collection
+        .select(shadowSumBands)
+        .reduce(ee.Reducer.stdDev());
+
+    var irMean = obj.collection
+        .select(shadowSumBands)
+        .mean();
+
+    // Enmascarar valores atípicos oscuros oscuros
+    var collection = obj.collection.map(
+        function (image) {
+            var zScore = image.select(shadowSumBands)
+                .subtract(irMean)
+                .divide(irStdDev);
+
+            var irSum = image.select(shadowSumBands)
+                .reduce(ee.Reducer.sum());
+
+            var tdomMask = zScore.lt(obj.zScoreThresh)
+                .reduce(ee.Reducer.sum())
+                .eq(2)
+                .and(irSum.lt(obj.shadowSumThresh))
+                .not();
+
+            tdomMask = tdomMask.focal_min(obj.dilatePixels);
+
+            return image.addBands(tdomMask.rename('tdomMask'));
+        }
+    );
+
+    return collection;
+};
+
+/**
+ * @name
+ *      cloudProject
+ * @description
+ *      
+ * @argument
+ *      Objecto que contiene los atributos
+ *          @attribute image {ee.Image}
+ *          @attribute cloudHeights {ee.List}
+ *          @attribute shadowSumThresh {Float}
+ *          @attribute dilatePixels {Integer}
+ *          @attribute cloudBand {String}
+ * @example
+ *      var obj = {
+ *          'image': image,
+ *          'cloudHeights': ee.List.sequence(200, 10000, 500),
+ *          'shadowSumThresh': 0.5,
+ *          'dilatePixels': 2,
+ *          'cloudBand': 'cloudScoreMask',
+ *      };
+ *      
+ *      image = cloudProject(obj);
+ * @returns
+ *      ee.Image
+ */
+var cloudProject = function (obj) {
+
+    // obtener la mascara de nube
+    var cloud = obj.image
+        .select(obj.cloudBand);
+
+    // Obtener máscara TDOM
+    var tdomMask = obj.image
+        .select(['tdomMask']);
+
+    //Proyecte los píxeles de búsqueda de sombras dentro de la máscara TDOM que son oscuros y
+    //dentro del área esperada dada la geometría solar
+    //Encuentra píxeles oscuros
+    var darkPixels = obj.image.select(['nir', 'swir1', 'swir2'])
+        .reduce(ee.Reducer.sum())
+        .lt(obj.shadowSumThresh);
+
+    //Obtener escala de imagen
+    var nominalScale = cloud
+        .projection()
+        .nominalScale();
+
+    // Encuentre dónde deberían estar las sombras de las nubes según la geometría solar
+    //Convierta a radianes.
+    var meanAzimuth = obj.image.get('sun_azimuth_angle');
+    var meanElevation = obj.image.get('sun_elevation_angle');
+
+    var azR = ee.Number(meanAzimuth)
+        .multiply(Math.PI)
+        .divide(180.0)
+        .add(ee.Number(0.5).multiply(Math.PI));
+
+    var zenR = ee.Number(0.5)
+        .multiply(Math.PI)
+        .subtract(ee.Number(meanElevation).multiply(Math.PI).divide(180.0));
+
+    //encuentra las sombras
+    var shadows = obj.cloudHeights.map(
+        function (cloudHeight) {
+
+            cloudHeight = ee.Number(cloudHeight);
+
+            var shadowCastedDistance = zenR.tan()
+                .multiply(cloudHeight); //Se proyecta la sombra a distancia
+            var x = azR.cos().multiply(shadowCastedDistance)
+                .divide(nominalScale).round(); //X distancia de la sombra
+
+            var y = azR.sin().multiply(shadowCastedDistance)
+                .divide(nominalScale).round(); //Y distancia de la sombra
+
+            return cloud.changeProj(cloud.projection(), cloud.projection()
+                .translate(x, y));
+        }
+    );
+
+    var shadow = ee.ImageCollection.fromImages(shadows).max().unmask();
+
+    //Crear mascara de sombra
+    shadow = shadow.focal_max(obj.dilatePixels);
+    shadow = shadow.and(darkPixels).and(tdomMask.not().and(cloud.not()));
+
+    var shadowMask = shadow
+        .rename(['shadowTdomMask']);
+
+    return obj.image.addBands(shadowMask);
+};
+
+
+var cloudBQAMaskToaLX = function (image) {
+
+    var qaBand = image.select('BQA');
+
+    var cloudMask = qaBand.bitwiseAnd(Math.pow(2, 5)).neq(0)
+        .or(qaBand.bitwiseAnd(Math.pow(2, 6)).neq(0))
+        .rename('cloudBQAMask');
+
+    return ee.Image(cloudMask);
+};
+
+var cloudBQAMaskToaS2 = function (image) {
+
+    var qaBand = image.select('BQA');
+
+    var cloudMask = qaBand.bitwiseAnd(Math.pow(2, 10)).neq(0)
+        .or(qaBand.bitwiseAnd(Math.pow(2, 11)).neq(0))
+        .rename('cloudBQAMask');
+
+    return ee.Image(cloudMask);
+};
+
+
+var cloudBQAMaskToa = function (image) {
+
+    var cloudMask = ee.Algorithms.If(
+        ee.String(image.get('satellite_name')).slice(0, 10).compareTo('Sentinel-2').not(),
+        cloudBQAMaskToaS2(image),
+        cloudBQAMaskToaLX(image)
+    );
+
+    return ee.Image(cloudMask);
+};
+
+
+var cloudBQAMaskSr = function (image) {
+
+    var qaBand = image.select(['pixel_qa']);
+
+    var cloudMask = qaBand.bitwiseAnd(Math.pow(2, 5)).neq(0)
+        .rename('cloudBQAMask');
+
+    return ee.Image(cloudMask);
+};
+
+
+var cloudBQAMask = function (image) {
+
+    var cloudMask = ee.Algorithms.If(
+        ee.String(image.get('reflectance')).compareTo('TOA').not(),
+        cloudBQAMaskToa(image),
+        cloudBQAMaskSr(image)
+    );
+
+    return image.addBands(ee.Image(cloudMask));
+};
+
+var shadowBQAMaskToaLX = function (image) {
+
+    var qaBand = image.select('BQA');
+
+    var cloudShadowMask = qaBand.bitwiseAnd(Math.pow(2, 7)).neq(0)
+        .or(qaBand.bitwiseAnd(Math.pow(2, 8)).neq(0))
+        .rename('shadowBQAMask');
+
+    return ee.Image(cloudShadowMask);
+};
+
+
+var shadowBQAMaskSrLX = function (image) {
+
+    var qaBand = image.select(['pixel_qa']);
+
+    var cloudShadowMask = qaBand.bitwiseAnd(Math.pow(2, 3)).neq(0)
+        .rename('shadowBQAMask');
+
+    return ee.Image(cloudShadowMask);
+};
+
+
+var shadowBQAMask = function (image) {
+
+    var cloudShadowMask = ee.Algorithms.If(
+        ee.String(image.get('satellite_name')).slice(0, 10).compareTo('Sentinel-2').not(),
+        // true
+        ee.Image(0).mask(image.select(0)).rename('shadowBQAMask'),
+        // false
+        ee.Algorithms.If(ee.String(image.get('reflectance')).compareTo('TOA').not(),
+            shadowBQAMaskToaLX(image),
+            shadowBQAMaskSrLX(image)
+        )
+    );
+
+    return image.addBands(ee.Image(cloudShadowMask));
+};
+
+/**
+ * @name
+ *      getMasks
+ * @description
+ *      
+ * @argument
+ *      Objecto contendo os atributos
+ *          @attribute collection {ee.ImageCollection}
+ *          @attribute cloudBQA {Boolean}
+ *          @attribute cloudScore {Boolean}
+ *          @attribute shadowBQA {Boolean}
+ *          @attribute shadowTdom {Boolean}
+ *          @attribute zScoreThresh { Float}
+ *          @attribute shadowSumThresh { Float}
+ *          @attribute dilatePixels { Integer}
+ *          @attribute cloudHeights {ee.List}
+ *          @attribute cloudBand {String}
+ * @example
+ *      var obj = {
+ *          'collection': collection,
+ *          'cloudBQA': true,
+ *          'cloudScore': true,
+ *          'shadowBQA': true,
+ *          'shadowTdom': true,
+ *          'zScoreThresh': -1,
+ *          'shadowSumThresh': 0.5,
+ *          'dilatePixels': 2,
+ *          'cloudHeights': ee.List.sequence(200, 10000, 500),
+ *          'cloudBand': 'cloudScoreMask'
+ *      };
+ *      
+ *      var collectionWithMasks = getMasks(obj);
+ * @returns
+ *      ee.ImageCollection
+ */
+var getMasks = function (obj) {
+
+    // Cloud mask
+    var collection = ee.Algorithms.If(obj.cloudBQA,
+        ee.Algorithms.If(obj.cloudScore,
+            // cloudBQA is true and cloudScore is true
+            obj.collection.map(cloudBQAMask).map(cloudScore),
+            // cloudBQA is true and cloudScore is false
+            obj.collection.map(cloudBQAMask)),
+        // cloudBQA is false and cloudScore is true
+        obj.collection.map(cloudScore));
+
+    collection = ee.ImageCollection(collection);
+
+    // mascara de nube
+    collection = ee.Algorithms.If(obj.shadowBQA,
+        ee.Algorithms.If(obj.shadowTdom,
+            // shadowBQA es verdadero y shadowTdom es verdadero
+            tdom({
+                'collection': collection.map(shadowBQAMask),
+                'zScoreThresh': obj.zScoreThresh,
+                'shadowSumThresh': obj.shadowSumThresh,
+                'dilatePixels': obj.dilatePixels,
+            }),
+            // shadowBQA es verdadero y shadowTdom es falso
+            collection.map(shadowBQAMask)),
+        // shadowBQA es falso y shadowTdom es verdadero
+        tdom({
+            'collection': collection,
+            'zScoreThresh': obj.zScoreThresh,
+            'shadowSumThresh': obj.shadowSumThresh,
+            'dilatePixels': obj.dilatePixels,
+        }));
+
+    collection = ee.ImageCollection(collection);
+
+    var getShadowTdomMask = function (image) {
+
+        image = cloudProject({
+            'image': image,
+            'shadowSumThresh': obj.shadowSumThresh,
+            'dilatePixels': obj.dilatePixels,
+            'cloudHeights': obj.cloudHeights,
+            'cloudBand': obj.cloudBand,
+        });
+
+        return image;
+    };
+
+    collection = ee.Algorithms.If(
+        obj.shadowTdom,
+        collection.map(getShadowTdomMask),
+        collection);
+
+    return ee.ImageCollection(collection);
+
+};
+
+
+/** 
+ * 
+ */
+var bandNames = {
+ 
+ 'l5': {
+      'bandNames': ['B1', 'B2', 'B3', 'B4', 'B5', 'B7', 'pixel_qa', 'B6'],
+      'newNames': ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'pixel_qa', 'temp']
+  },
+  
+ 'l7': {
+      'bandNames': ['B1', 'B2', 'B3', 'B4', 'B5', 'B7', 'pixel_qa', 'B6'],
+      'newNames': ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'pixel_qa', 'temp']
+  },
+
+  'l8' : {
+      'bandNames': ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B10', 'pixel_qa', 'B11'],
+      'newNames':  ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'thermal', 'pixel_qa', 'temp']
+  },
+
+  'l4_sr2': {
+      'bandNames': ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'QA_PIXEL', 'SR_B6'],
+      'newNames':  ['blue',  'green', 'red',   'nir',   'swir1', 'swir2', 'pixel_qa', 'temp']
+  },
+  
+  'l5_sr2': {
+      'bandNames': ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'QA_PIXEL', 'SR_B6'],
+      'newNames':  ['blue',  'green', 'red',   'nir',   'swir1', 'swir2', 'pixel_qa', 'temp']
+  },
+  
+  'l7_sr2': {
+      'bandNames': ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'QA_PIXEL', 'SR_B6'],
+      'newNames':  ['blue',  'green', 'red',   'nir',   'swir1', 'swir2', 'pixel_qa', 'temp']
+  },
+  
+  'l8_sr2' : {
+      'bandNames': ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'ST_B10',  'QA_PIXEL'],
+      'newNames':  ['blue',  'green', 'red',   'nir',   'swir1', 'swir2', 'temp',    'pixel_qa']
+  },
+  
+  'l5toa': {
+      'bandNames': ['B1', 'B2', 'B3', 'B4', 'B5', 'B7', 'BQA', 'B6'],
+      'newNames': ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'BQA', 'temp']
+  },
+  
+ 'l7toa': {
+      'bandNames': ['B1', 'B2', 'B3', 'B4', 'B5', 'B7', 'BQA', 'B6_VCID_1'],
+      'newNames': ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'BQA', 'temp']
+  },
+
+  'l8toa' : {
+      'bandNames': ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B10', 'BQA', 'B11'],
+      'newNames': ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'thermal', 'BQA', 'temp']
+  },
+  
+  'sentinel2' : {
+      'bandNames': ['B2','B3','B4','B8','B11','B12','QA60'],
+      'newNames': ['blue','green','red','nir','swir1','swir2','BQA']
+  },
+};
+
+/**
+ * @name
+ *      rename
+ * @description
+ *     estandariza los nombres de las bandas de imágenes landsat 5,7, y sentinel 2
+ * @argument
+ *      Objeto que contiene el atributo
+ *          @attribute key {String}
+ * @example
+ *      var bands_l7 = get('l7');
+ * @returns
+ *      Dictionary
+ */
+var getBN = function (key) {
+
+    return bandNames[key];
+};
+
+
+/** 
+ * @name
+ *      setProperties
+ * @description
+ *      Normaliza algunas propiedades entre imágenes Landsat y Sentinel-2
+ * @argument
+ *      ee.Image
+ * @returns
+ *      ee.Image
+ */
+var setProperties = function (image) {
+
+    var cloudCover = ee.Algorithms.If(image.get('SPACECRAFT_NAME'),
+        image.get('CLOUDY_PIXEL_PERCENTAGE'),
+        image.get('CLOUD_COVER')
+    );
+
+    var date = ee.Algorithms.If(image.get('DATE_ACQUIRED'),
+        image.get('DATE_ACQUIRED'),
+        ee.Algorithms.If(image.get('SENSING_TIME'),
+            image.get('SENSING_TIME'),
+            image.get('GENERATION_TIME')
+        )
+    );
+
+    var satellite = ee.Algorithms.If(image.get('SPACECRAFT_ID'),
+        image.get('SPACECRAFT_ID'),
+        ee.Algorithms.If(image.get('SATELLITE'),
+            image.get('SATELLITE'),
+            image.get('SPACECRAFT_NAME')
+        )
+    );
+
+    var azimuth = ee.Algorithms.If(image.get('SUN_AZIMUTH'),
+        image.get('SUN_AZIMUTH'),
+        ee.Algorithms.If(image.get('SOLAR_AZIMUTH_ANGLE'),
+            image.get('SOLAR_AZIMUTH_ANGLE'),
+            image.get('MEAN_SOLAR_AZIMUTH_ANGLE')
+        )
+    );
+
+    var elevation = ee.Algorithms.If(image.get('SUN_ELEVATION'),
+        image.get('SUN_ELEVATION'),
+        ee.Algorithms.If(image.get('SOLAR_ZENITH_ANGLE'),
+            ee.Number(90).subtract(image.get('SOLAR_ZENITH_ANGLE')),
+            ee.Number(90).subtract(image.get('MEAN_SOLAR_ZENITH_ANGLE'))
+        )
+    );
+
+    var reflectance = ee.Algorithms.If(
+        ee.String(ee.Dictionary(ee.Algorithms.Describe(image)).get('id')).match('SR').length(),
+        'SR',
+        'TOA'
+    );
+
+    return image
+        .set('image_id', image.id())
+        .set('cloud_cover', cloudCover)
+        .set('satellite_name', satellite)
+        .set('sun_azimuth_angle', azimuth)
+        .set('sun_elevation_angle', elevation)
+        .set('reflectance', reflectance)
+        .set('date', ee.Date(date).format('Y-MM-dd'));
+};
+
+/**
+ * @name
+ *      getCollection
+ * @description
+ *      crea una colección de imágenes aplicando filtros de metadados
+ * @argument
+ *      Objeto que coniene los atributos
+ *          @attribute collectionid {String} 
+ *          @attribute geometry {ee.Geometry}
+ *          @attribute dateStart {String 'yyyy-mm-dd'}
+ *          @attribute dateEnd {String 'yyyy-mm-dd'}
+ *          @attribute cloud_cover {Float}
+ * @example
+ *      var obj = {
+ *          'collectionid': 'LANDSAT/LC08/C01/T1_TOA', //COPERNICUS/S2
+ *          'geometry': geometry,
+ *          'dateStart': '2020-01-01',
+ *          'dateEnd': '2020-12-31',
+ *          'cloudCover': 50,
+ *      };
+ *      
+ *      var collection = getCollection(obj);
+ * @returns
+ *      ee.ImageCollection
+ */
+var getCollection = function (obj) {
+
+    var filters = ee.Filter.and(
+        ee.Filter.bounds(obj.geometry),
+        ee.Filter.date(obj.dateStart, obj.dateEnd),
+        ee.Filter.lte('cloud_cover', obj.cloudCover)
+    );
+
+    var collection = ee.ImageCollection(obj.collectionid)
+        .map(setProperties)
+        .filter(filters);
+
+    return collection;
+};
+
+
+var getImages = function (param, blackList, grid) {
+    var options = {
+
+        dates: {
+            t0: param.t0,
+            t1: param.t1
+        },
+
+        collection: null,
+
+        regionMosaic: param.regionMosaic,
+        gridName: param.grid_name,
+        cloudCover: param.cloud_cover,
+        shadowSum: param.shadowSum,
+        cloudThresh: param.cloudThresh,
+        
+        blackList: blackList,
+
+        imageList: [],
+
+        collectionid: param.satellite,
+
+        collectionIds: {
+            'l4': [
+                'LANDSAT/LT04/C01/T1_SR'
+            ],
+            'l5': [
+                'LANDSAT/LT05/C01/T1_SR'
+            ],
+            'l7': [
+                'LANDSAT/LE07/C01/T1_SR'
+            ],
+            'l8': [
+                'LANDSAT/LC08/C01/T1_SR'
+            ],
+            'lx': [
+                'LANDSAT/LT05/C01/T1_SR',
+                'LANDSAT/LE07/C01/T1_SR'
+            ],
+        },
+
+        // miembros finales: {
+        //     'l4': sma.endmembers['landsat-4'],
+        //     'l5': sma.endmembers['landsat-5'],
+        //     'l7': sma.endmembers['landsat-7'],
+        //     'l8': sma.endmembers['landsat-8'],
+        //     'lx': sma.endmembers['landsat-5'],
+        // },
+
+        bqaValue: {
+            'l4': ['pixel_qa', Math.pow(2, 5)],
+            'l5': ['pixel_qa', Math.pow(2, 5)],
+            'l7': ['pixel_qa', Math.pow(2, 5)],
+            'l8': ['pixel_qa', Math.pow(2, 5)],
+            'lx': ['pixel_qa', Math.pow(2, 5)],
+        },
+        bandIds: {
+            'LANDSAT/LT04/C01/T1_SR': 'l4',
+            'LANDSAT/LT05/C01/T1_SR': 'l5',
+            'LANDSAT/LE07/C01/T1_SR': 'l7',
+            'LANDSAT/LC08/C01/T1_SR': 'l8',
+        },
+        visParams: {
+            bands: 'swir1,nir,red',
+            gain: '0.08,0.06,0.2',
+            gamma: 0.75
+        }
+    }
+    
+    var applyCloudAndSahdowMask = function (collection) {
+
+        var collectionWithMasks = getMasks({
+            'collection': collection,
+            'cloudBQA': true,    // máscara de nube con control de calidad de píxeles QA
+            'cloudScore': true,  // cloud mas usando una puntuacion de nube simple
+            'shadowBQA': true,   // máscara de sombra de nube con control de calidad de píxeles QA
+            'shadowTdom': true,  // sombra de nube usando tdom
+            'zScoreThresh': -1,
+            'shadowSumThresh': options.shadowSum,
+            'cloudThresh':options.cloudThresh,
+            'dilatePixels': 2,
+            'cloudHeights': ee.List.sequence(2000, 10000, 500),
+            'cloudBand': 'cloudScoreMask' //'cloudScoreMask' or 'cloudBQAMask'
+        });
+
+        // obtener coleccion sin nubes
+        var collectionWithoutClouds = collectionWithMasks.map(
+            function (image) {
+                return image.mask(
+                    image.select([
+                        'cloudBQAMask',
+                        'cloudScoreMask',
+                        'shadowBQAMask',
+                        'shadowTdomMask'
+                    ]).reduce(ee.Reducer.anyNonZero()).eq(0)
+                );
+            }
+        );
+
+        return collectionWithoutClouds;
+    }
+
+    var applySingleCloudMask = function (image) {
+
+        return image.mask(
+            image.select(options.bqaValue[options.collectionid][0])
+                .bitwiseAnd(options.bqaValue[options.collectionid][1]).not());
+    }
+
+    var processCollection =  function (collectionid) {
+
+        var spectralBands = ['blue', 'red', 'green', 'nir', 'swir1', 'swir2'];
+
+        var objLandsat = {
+            'collectionid': collectionid,
+            'geometry':     grid.geometry(),
+            'dateStart':    options.dates.t0.slice(0, 4)+'-01-01',
+            'dateEnd':      options.dates.t1.slice(0, 4)+'-12-31',
+            'cloudCover':   options.cloudCover,
+        };
+
+        var bands = getBN(options.bandIds[collectionid]);
+
+        var collection = getCollection(objLandsat)
+            .select(bands.bandNames, bands.newNames)
+            .filter(ee.Filter.inList('system:index', options.blackList).not());
+
+         collection = applyCloudAndSahdowMask(collection)
+                     .select(spectralBands);
+
+        return collection
+    }
+    
+    var makeCollection = function () {
+
+        var collection = processCollection(
+                     options.collectionIds[options.collectionid][0]);
+
+        // Desenmascarar datos con el mosaico secundario (+L5 o +L7)
+        if (options.collectionIds[options.collectionid].length == 2) {
+            var collection2 = processCollection(
+                options.collectionIds[options.collectionid][1]);
+
+            collection = collection.merge(collection2);
+        }
+
+      return collection
+    }
+
+    var coll = makeCollection()
+
+    var coll_median = coll.filterDate(options.dates.t0, options.dates.t1)
+    //print(coll_median)
+    
+    return coll_median
+}
+
+//*****
+
+
+var collection_without_blacklist = getImages(param, [],grid);
+var collection_with_blacklist = getImages(param, blackList,grid);
+
+
+
+print('collection sin blackList:', collection_without_blacklist);
+print('collection con blackList:', collection_with_blacklist);
+
+Map.centerObject(grid, 10);
+
+/**
+ * Despliega en el mapa los mosaicos y polígonos necesarios
+ * para la visualización
+ */
+
+Map.addLayer(
+    grid.style({ fillColor: 'f8fc03', color: 'f8fc0300'}), 
+    {}, 'Background'
+);
+
+Map.addLayer(collection_without_blacklist.median().clip(region).clip(grid), {
+        bands: 'swir1,nir,red',
+        gain: '0.08,0.06,0.2'
+    },
+    'MOSAIC',
+    true
+);
+                    
+Map.addLayer(collection_with_blacklist.median().clip(region).clip(grid), {
+        bands: 'red,green,blue',
+        gain: '0.3,0.3,0.3'
+    },
+    'MOSAIC BLACK LIST',
+    true 
+);
+
+Map.addLayer(
+    region.style({ fillColor: '#ff000000', color: 'f59e42'}),
+    {}, 'Regions ' + param.pais, false
+);
+
+/**
+ * Despliega las escenas landsat disponibles para cada mosaico, de manera que
+ * se puede visualizar cómo afecta la calidad del mosaico
+ */
+collection_with_blacklist.reduceColumns(ee.Reducer.toList(), ['system:index'])
+  .get('list')
+  .evaluate(
+      function(ids){
+          ids.forEach(
+              function(imageid){
+                  var image = collection_with_blacklist.filterMetadata('system:index', 'equals', imageid);
+                  image = image.mosaic()//.clip(paises);
+                  Map.addLayer(image, {
+                        bands: 'swir1,nir,red',
+                        gain: '0.08,0.06,0.2'
+                        },
+                        imageid,
+                        false
+                    );
+                  print(imageid);
+              }
+          );
+      }  
+  );
+  
+  
+// aplicacion de indices espectrales
+//***************************INDICES*********************
+var NDVI = function(image) {
+
+    var ndvi = image.expression('float(nir - red)/(nir + red)', {
+        'nir': image.select('nir'),
+        'red': image.select('red')
+    }); // rescale NDVI from 0-200
+
+    return ndvi.rename("ndvi");
+
+};
+
+var NDWI = function(image) {
+
+    var ndwi = image.expression('float(nir - green)/(nir + green)', {
+        'green': image.select('green'),
+        'nir': image.select('nir')
+    });
+
+    return ndwi.rename("ndwi");
+
+};
+
+var SAVI = function(image) {
+
+    var savi = image.expression('(1 + L) * float(nir - red)/(nir + red + L)', {
+        'nir': image.select('nir'),
+        'red': image.select('red'),
+        'L': 0.5
+    });
+
+    return savi.rename("savi");
+
+};
+
+var EVI = function(image) {
+
+    var evi = image.expression('(2.5 * float(nir - red)/(nir + 6 * red - 7.5 * blue + 1))', {
+        'nir': image.select('nir'),
+        'red': image.select('red'),
+        'blue': image.select('blue'),
+    });
+
+
+    return evi.rename("evi");
+
+};
+
+//************Aplicación de mínimo,máximo y mediana a los Índices espectrales ********************************************************
+
+var ndvi_median = NDVI(collection_with_blacklist.median()).rename('ndvi_median');
+var ndwi_median = NDWI(collection_with_blacklist.median()).rename('ndwi_median');
+var savi_median = SAVI(collection_with_blacklist.median()).rename('savi_median');
+var evi_median = EVI(collection_with_blacklist.median()).rename('evi_median');
+
+var ndvi_max = collection_with_blacklist.map(NDVI).max().rename('ndvi_max');
+var ndwi_max = collection_with_blacklist.map(NDWI).max().rename('ndwi_max');
+var savi_max = collection_with_blacklist.map(SAVI).max().rename('savi_max');
+var evi_max = collection_with_blacklist.map(EVI).max().rename('evi_max');
+
+var ndvi_min = collection_with_blacklist.map(NDVI).min().rename('ndvi_min');
+var ndwi_min = collection_with_blacklist.map(NDWI).min().rename('ndwi_min');
+var savi_min = collection_with_blacklist.map(SAVI).min().rename('savi_min');
+var evi_min = collection_with_blacklist.map(EVI).min().rename('evi_min');
+
+var demSRTM = ee.Image('USGS/SRTMGL1_003')//.clip(buffcuenca);
+var slope = ee.Terrain.slope(demSRTM).updateMask(collection_with_blacklist.median().select('nir'));
+
+var Mosaic = collection_with_blacklist.median()
+                           .addBands(ndvi_median)
+                           .addBands(ndwi_median)
+                           .addBands(savi_median)
+                           .addBands(evi_median)
+                           .addBands(ndvi_min)
+                           .addBands(ndwi_min)
+                           .addBands(savi_min)
+                           .addBands(evi_min)
+                           .addBands(ndvi_max)
+                           .addBands(ndwi_max)
+                           .addBands(savi_max)
+                           .addBands(evi_max)
+                           .addBands(slope)
+                           //.clip(buffcuenca);//activar para cortar en base al area de estudio
+//print(Mosaic);                     
+//Map.addLayer(Mosaic, {bands: ['B6', 'B5', 'B4'], min: 0, max: 0.3}, 'Landsat'+ Year);//activar para visualización 
+
+//*********************************************************************************
+
+// ----------------Areas de entrenamiento------------------------
+
+var Areas_entrenamiento = ee.FeatureCollection([pasto,nopasto]).flatten();
+
+var muestra = Mosaic.sampleRegions(Areas_entrenamiento, ['clase'], 30);
+
+//----------------------------------------------------------------------------------------
+
+//------------------Clasificacion Randon forest -----------------
+
+var clasificador_RF = ee.Classifier.smileRandomForest(10).train(muestra, 'clase');
+
+var clasificacion_RF = Mosaic.classify(clasificador_RF).clip(region);
+
+Map.addLayer(clasificacion_RF,{max:2, 
+                               min:1,
+                               palette:['044203', '#ff5f0a']},
+                              'Clasificaion_RF-'+ (param.t0.slice(0,4)));  //'201-01-01'
+
+
+
+//exportar mapa tiff
+Export.image.toDrive({
+  image: clasificacion_RF,
+  folder: "pastura",
+  fileNamePrefix:"clasi_poma2020",
+  scale:30,
+  maxPixels:1757408719,
+  region: region,
+  fileFormat:"Geotiff"
+});
